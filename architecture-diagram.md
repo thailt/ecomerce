@@ -4,25 +4,25 @@
 
 ```mermaid
 graph TB
-    subgraph "Client Layer"
+    subgraph ClientLayer["Client Layer"]
         U[Users/Browsers]
     end
     
-    subgraph "Load Balancing Layer"
+    subgraph LoadBalancerLayer["Load Balancing Layer"]
         LB[Nginx Load Balancer<br/>Health Checks + SSL]
     end
     
-    subgraph "Application Layer - 2 Servers"
+    subgraph AppLayer["Application Layer - 2 Servers"]
         APP1[App Server 1<br/>Spring Boot 3.x<br/>Virtual Threads]
         APP2[App Server 2<br/>Spring Boot 3.x<br/>Virtual Threads]
     end
     
-    subgraph "Cache & Message Broker Layer - 2 Servers"
+    subgraph CacheLayer["Cache and Message Broker Layer"]
         SERVER5[Server 5<br/>Redis Cluster Node 1<br/>+ Kafka Broker 1<br/>Memory + Disk]
         SERVER6[Server 6<br/>Redis Cluster Node 2<br/>+ Kafka Broker 2<br/>Memory + Disk]
     end
     
-    subgraph "Database Layer - 2 Servers"
+    subgraph DatabaseLayer["Database Layer - 2 Servers"]
         DB1[(MySQL Primary<br/>Writes + Critical Reads)]
         DB2[(MySQL Replica<br/>Read-Only)]
     end
@@ -206,32 +206,33 @@ graph TB
     subgraph "Normal Operation"
         N1[All 2 App Servers Active]
         N2[Primary DB + 1 Replica]
-        N3[Redis Cluster (2 nodes)]
-        N4[Kafka Cluster (2 brokers)]
+        N3[Redis Cluster - 2 nodes]
+        N4[Kafka Cluster - 2 brokers]
     end
     
     subgraph "App Server Failure"
         A1[App Server 1 Down]
         A2[Load Balancer Detects Failure]
         A3[Routes to App Server 2]
-        A4[System Continues at 50% Capacity<br/>Saga state in Kafka]
+        A4["System Continues at 50% Capacity<br/>Saga state in Kafka"]
     end
     
     subgraph "Primary DB Failure"
         D1[Primary DB Down]
         D2[Replica Promoted to Primary]
-        D3[System Continues (No Read Replica)]
+        D3[System Continues - No Read Replica]
     end
     
     subgraph "Redis+Kafka Server Failure"
-        RK1[Server 5 Down (Redis+Kafka)]
-        RK2[Redis Cluster continues với Server 6]
-        RK3[Kafka Cluster continues với Broker 2]
-        RK4[System Continues Normally<br/>Perfect Resource Sharing]
+        RK1[Server 5 Down - Redis+Kafka]
+        RK2[Redis Cluster continues with Server 6]
+        RK3[Kafka Cluster continues with Broker 2]
+        RK4["System Continues Normally<br/>Perfect Resource Sharing"]
     end
     
     N1 --> A1
     N2 --> D1
-    N3 --> R1
+    N3 --> RK1
+    N4 --> RK1
 ```
 
