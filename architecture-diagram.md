@@ -17,9 +17,9 @@ graph TB
         APP2[App Server 2<br/>Spring Boot 3.x<br/>Virtual Threads]
     end
     
-    subgraph "Cache & Coordination Layer"
-        REDIS1[Redis Node 1<br/>Master<br/>Cache + Locking + Pub/Sub]
-        REDIS2[Redis Node 2<br/>Slave<br/>Cache + Locking + Pub/Sub]
+    subgraph "Cache & Message Broker Layer - 2 Servers"
+        SERVER5[Server 5<br/>Redis Cluster Node 1<br/>+ Kafka Broker 1<br/>Memory + Disk]
+        SERVER6[Server 6<br/>Redis Cluster Node 2<br/>+ Kafka Broker 2<br/>Memory + Disk]
     end
     
     subgraph "Database Layer - 2 Servers"
@@ -31,10 +31,10 @@ graph TB
     LB --> APP1
     LB --> APP2
     
-    APP1 --> REDIS1
-    APP1 --> REDIS2
-    APP2 --> REDIS1
-    APP2 --> REDIS2
+    APP1 --> SERVER5
+    APP1 --> SERVER6
+    APP2 --> SERVER5
+    APP2 --> SERVER6
     
     APP1 --> DB1
     APP1 --> DB2
@@ -43,7 +43,12 @@ graph TB
     
     DB1 -.->|Replication| DB2
     
-    REDIS1 -.->|Master-Slave<br/>Replication| REDIS2
+    SERVER5 -.->|Redis Cluster| SERVER6
+    SERVER5 -.->|Kafka Cluster| SERVER6
+    SERVER5 -.->|Saga Events| APP1
+    SERVER5 -.->|Saga Events| APP2
+    SERVER6 -.->|Saga Events| APP1
+    SERVER6 -.->|Saga Events| APP2
 ```
 
 ## Request Flow - Product Viewing
@@ -73,20 +78,21 @@ sequenceDiagram
     end
 ```
 
-## Request Flow - Product Purchase
+## Request Flow - Product Purchase (Saga Pattern)
 
 ```mermaid
 sequenceDiagram
     participant U as User
     participant LB as Load Balancer
-    participant APP as App Server
+    participant APP as Saga Orchestrator
     participant Redis as Redis Cache
     participant DB as MySQL Primary
+    participant KAFKA as Kafka Broker
     
     U->>LB: POST /purchase {productId: 123, qty: 2}
     LB->>APP: Route to App Server
     
-    APP->>Redis: SETNX lock:product:123 (5s TTL)
+    APP->>Redis: SETNX lock:product:123 (30s TTL)
     alt Lock Acquired
         Redis-->>APP: Lock Acquired
         
@@ -94,18 +100,31 @@ sequenceDiagram
         Redis-->>APP: Stock: 10
         
         alt Sufficient Stock
-            APP->>DB: BEGIN TRANSACTION
-            APP->>DB: SELECT * FROM products WHERE id=123 FOR UPDATE
-            DB-->>APP: Product Row (locked)
+            APP->>KAFKA: Publish SagaStartEvent
+            KAFKA-->>APP: Event Published
             
-            APP->>DB: UPDATE products SET stock=stock-2, version=version+1 WHERE id=123 AND stock>=2
-            DB-->>APP: 1 row updated
+            Note over APP,DB: Step 1: Reserve Inventory
+            APP->>DB: BEGIN TX: UPDATE reserved_stock
+            DB-->>APP: Reserved
+            APP->>KAFKA: Publish InventoryReservedEvent
+            KAFKA-->>APP: Event Published
             
-            APP->>DB: INSERT INTO orders (product_id, quantity)
-            DB-->>APP: Order Created
+            Note over APP,DB: Step 2: Create Order
+            APP->>DB: BEGIN TX: INSERT INTO orders
+            DB-->>APP: Order Created (id: 456)
+            APP->>KAFKA: Publish OrderCreatedEvent
+            KAFKA-->>APP: Event Published
             
-            APP->>DB: COMMIT
-            DB-->>APP: Transaction Committed
+            Note over APP: Step 3: Process Payment
+            APP->>APP: Process Payment
+            APP->>KAFKA: Publish PaymentProcessedEvent
+            KAFKA-->>APP: Event Published
+            
+            Note over APP,DB: Step 4: Confirm Order
+            APP->>DB: BEGIN TX: UPDATE order status + finalize inventory
+            DB-->>APP: Confirmed
+            APP->>KAFKA: Publish OrderConfirmedEvent
+            KAFKA-->>APP: Event Published
             
             APP->>Redis: DECR product:123:stock (by 2)
             Redis-->>APP: Updated Stock: 8
@@ -113,11 +132,8 @@ sequenceDiagram
             APP->>Redis: DEL lock:product:123
             Redis-->>APP: Lock Released
             
-            APP->>Redis: PUBLISH order.created (Pub/Sub)
-            Redis-->>APP: Event Published (non-blocking)
-            
             APP-->>LB: Purchase Success
-            LB-->>U: Success Response (~50ms)
+            LB-->>U: Success Response (~100ms)
         else Insufficient Stock
             APP->>Redis: DEL lock:product:123
             APP-->>LB: Insufficient Stock Error
@@ -128,36 +144,44 @@ sequenceDiagram
         APP-->>LB: Product Being Processed
         LB-->>U: Retry Response (~5ms)
     end
+    
+    Note over APP,KAFKA: If any step fails:<br/>Compensation events published<br/>Rollback in reverse order
 ```
 
-## Data Consistency Mechanism
+## Data Consistency Mechanism (Saga Pattern)
 
 ```mermaid
 graph LR
     subgraph "Layer 1: Distributed Lock"
-        L1[Redis SETNX Lock<br/>5 second TTL<br/>Prevents concurrent access]
+        L1[Redis SETNX Lock<br/>30 second TTL<br/>Prevents concurrent access]
     end
     
-    subgraph "Layer 2: Database Transaction"
-        L2[MySQL FOR UPDATE<br/>Row-level locking<br/>ACID transaction]
+    subgraph "Layer 2: Saga Orchestration"
+        L2[Kafka Events<br/>Saga coordination<br/>Event sourcing]
     end
     
-    subgraph "Layer 3: Optimistic Locking"
-        L3[Version Field Check<br/>WHERE version = ?<br/>Prevents lost updates]
+    subgraph "Layer 3: Local Transactions"
+        L3[Step 1: Reserve Inventory<br/>Step 2: Create Order<br/>Step 3: Process Payment<br/>Step 4: Confirm Order]
     end
     
-    subgraph "Layer 4: Cache Consistency"
-        L4[Atomic DECR in Redis<br/>Cache invalidation<br/>TTL refresh]
+    subgraph "Layer 4: Compensation"
+        L4[Automatic Rollback<br/>Reverse order compensation<br/>Event-driven]
+    end
+    
+    subgraph "Layer 5: Cache Consistency"
+        L5[Atomic DECR in Redis<br/>After saga completes<br/>TTL refresh]
     end
     
     L1 --> L2
     L2 --> L3
     L3 --> L4
+    L4 --> L5
     
     style L1 fill:#ff9999
     style L2 fill:#99ccff
     style L3 fill:#99ff99
     style L4 fill:#ffcc99
+    style L5 fill:#ff99cc
 ```
 
 ## Capacity Distribution
@@ -182,14 +206,15 @@ graph TB
     subgraph "Normal Operation"
         N1[All 2 App Servers Active]
         N2[Primary DB + 1 Replica]
-        N3[Redis Master-Slave (2 Nodes)]
+        N3[Redis Cluster (2 nodes)]
+        N4[Kafka Cluster (2 brokers)]
     end
     
     subgraph "App Server Failure"
         A1[App Server 1 Down]
         A2[Load Balancer Detects Failure]
         A3[Routes to App Server 2]
-        A4[System Continues at 50% Capacity]
+        A4[System Continues at 50% Capacity<br/>Saga state in Kafka]
     end
     
     subgraph "Primary DB Failure"
@@ -198,11 +223,11 @@ graph TB
         D3[System Continues (No Read Replica)]
     end
     
-    subgraph "Redis Master Failure"
-        R1[Redis Master Down]
-        R2[Slave Promoted to Master]
-        R3[Data Replicated from Previous Master]
-        R4[System Continues with Single Redis Node]
+    subgraph "Redis+Kafka Server Failure"
+        RK1[Server 5 Down (Redis+Kafka)]
+        RK2[Redis Cluster continues với Server 6]
+        RK3[Kafka Cluster continues với Broker 2]
+        RK4[System Continues Normally<br/>Perfect Resource Sharing]
     end
     
     N1 --> A1

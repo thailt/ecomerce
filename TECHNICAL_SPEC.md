@@ -4,19 +4,27 @@
 
 ### Input Parameters
 - **N = 6000**: Concurrent requests
-- **S = 4**: Total servers
+- **S = 6**: Total servers
 - **C = 300**: Max connections per database
 
 ### Server Allocation Strategy
 
-| Server | Role | Purpose | Connections |
-|--------|------|---------|-------------|
-| Server 1 | Application | Spring Boot App | - |
-| Server 2 | Application | Spring Boot App | - |
-| Server 3 | Database | MySQL Primary | 300 max |
-| Server 4 | Database | MySQL Replica | 300 max |
+| Server | Role | Purpose | Resource Usage |
+|--------|------|---------|----------------|
+| Server 1 | Application | Spring Boot App với Saga Orchestrator | CPU + Memory |
+| Server 2 | Application | Spring Boot App với Saga Orchestrator | CPU + Memory |
+| Server 3 | Database | MySQL Primary | CPU + Memory + Disk |
+| Server 4 | Database | MySQL Replica | CPU + Memory + Disk |
+| Server 5 | Redis + Kafka | Redis Cluster Node + Kafka Broker 1 | Redis: Memory, Kafka: Disk |
+| Server 6 | Redis + Kafka | Redis Cluster Node + Kafka Broker 2 | Redis: Memory, Kafka: Disk |
 
 **Total Database Connections**: 300 + 300 = 600 = 600 (2 × 300) ✓
+
+**Resource Optimization**:
+- **Server 5 & 6**: Perfect resource sharing
+  - Redis: Sử dụng RAM (memory) - không conflict với Kafka
+  - Kafka: Sử dụng Disk (storage) - không conflict với Redis
+  - Optimal utilization: Tận dụng cả memory và disk trên cùng server
 
 ### Request Distribution Analysis
 
@@ -34,8 +42,12 @@ Cache Misses: 4800 × 0.17 = 816 requests → DB Replica
 
 **Write Operations (1200 requests)**:
 ```
-Direct Writes: 1200 requests → Primary DB (synchronous, blocking calls)
-Redis Pub/Sub: Publishes events for async notifications
+Saga Orchestration: 1200 requests → Saga steps với Kafka events
+  - Step 1: Reserve Inventory (local TX)
+  - Step 2: Create Order (local TX)
+  - Step 3: Process Payment
+  - Step 4: Confirm Order (local TX)
+Kafka: Publishes saga events cho coordination và event sourcing
 ```
 
 **Actual Database Load**:
@@ -193,9 +205,10 @@ T15                                    Return: Insufficient Stock
 
 | Component | Redundancy Strategy | Failover Time |
 |-----------|---------------------|---------------|
-| Application Servers | 2 instances, load balancer health checks | < 5 seconds |
+| Application Servers | 2 instances với Saga Orchestrator, load balancer health checks | < 5 seconds |
 | Primary Database | 1 primary + 1 replica, auto-promotion | < 30 seconds |
-| Redis Cluster | 2 nodes (Master-Slave), data replication + pub/sub channels | < 5 seconds |
+| Kafka Cluster | 2 brokers với replication factor = 2 | < 10 seconds (automatic failover) |
+| Redis Cluster | 2 nodes với cluster mode và data replication | < 5 seconds (automatic failover) |
 | Load Balancer | Active-passive (or cloud LB) | < 1 second |
 
 ### Health Check Configuration
@@ -264,9 +277,12 @@ read-only = 1
 
 ## Scalability Roadmap
 
-### Phase 1: Current (4 Servers)
-- 2 App Servers
+### Phase 1: Current (6 Servers)
+- 2 App Servers với Saga Orchestrator
 - 1 Primary DB + 1 Replica
+- 2 Redis+Kafka Servers (perfect resource sharing):
+  - Server 1: Redis cluster node (memory) + Kafka broker 1 (disk)
+  - Server 2: Redis cluster node (memory) + Kafka broker 2 (disk)
 - Handles 6000 concurrent requests
 
 ### Phase 2: Horizontal Scaling (Add App Servers)
@@ -374,12 +390,14 @@ services:
       - SPRING_PROFILES_ACTIVE=prod
       - DB_PRIMARY_URL=jdbc:mysql://db-primary:3306/ecommerce
       - DB_REPLICA_URL=jdbc:mysql://db-replica:3306/ecommerce
-      - REDIS_HOST=redis-1
-      - REDIS_PORT=6379
+      - REDIS_CLUSTER_NODES=redis-kafka-1:6379,redis-kafka-2:6379
+      - KAFKA_BOOTSTRAP_SERVERS=redis-kafka-1:9092,redis-kafka-2:9092
     depends_on:
       - db-primary
-      - redis-1
-      - redis-2
+      - redis-node-1
+      - redis-node-2
+      - kafka-broker-1
+      - kafka-broker-2
   
   db-primary:
     image: mysql:8.0
@@ -388,10 +406,161 @@ services:
       - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
       - MYSQL_REPLICATION_MODE=master
   
-  redis-1:
+  # Server 5: Redis Cluster Node 1 + Kafka Broker 1
+  # Redis uses memory, Kafka uses disk - perfect resource sharing
+  
+  redis-node-1:
     image: redis:7-alpine
-    command: redis-server --cluster-enabled yes
+    hostname: redis-kafka-1
+    command: >
+      redis-server
+      --cluster-enabled yes
+      --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000
+      --appendonly yes
+      --maxmemory 4gb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-1-data:/data
+    ports:
+      - "6379:6379"
+    deploy:
+      resources:
+        limits:
+          memory: 4G  # Redis uses memory
+        reservations:
+          memory: 2G
+  
+  kafka-broker-1:
+    image: apache/kafka:3.7.0  # Kafka 3.7+ với KRaft mode
+    hostname: redis-kafka-1
+    environment:
+      # KRaft Mode Configuration (no Zookeeper)
+      - KAFKA_NODE_ID=1
+      - KAFKA_PROCESS_ROLES=broker,controller
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@redis-kafka-1:9093,2@redis-kafka-2:9093
+      - KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://redis-kafka-1:9092
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      # Log configuration
+      - KAFKA_LOG_DIRS=/var/lib/kafka/data
+      - KAFKA_LOG_RETENTION_HOURS=168  # 7 days
+      - KAFKA_LOG_SEGMENT_BYTES=1073741824  # 1GB
+      # Metadata configuration
+      - KAFKA_METADATA_LOG_DIR=/var/lib/kafka/metadata
+      # Replication
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=2
+      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=2
+      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+      - KAFKA_DEFAULT_REPLICATION_FACTOR=2
+      - KAFKA_MIN_INSYNC_REPLICAS=1
+    volumes:
+      - kafka-1-data:/var/lib/kafka/data  # Kafka uses disk
+      - kafka-1-metadata:/var/lib/kafka/metadata  # KRaft metadata
+    ports:
+      - "9092:9092"  # Broker port
+      - "9093:9093"  # Controller port
+    deploy:
+      resources:
+        limits:
+          memory: 2G  # Kafka JVM heap
+        reservations:
+          memory: 1G
+  
+  # Server 6: Redis Cluster Node 2 + Kafka Broker 2
+  # Redis uses memory, Kafka uses disk - perfect resource sharing
+  
+  redis-node-2:
+    image: redis:7-alpine
+    hostname: redis-kafka-2
+    command: >
+      redis-server
+      --cluster-enabled yes
+      --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000
+      --appendonly yes
+      --maxmemory 4gb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-2-data:/data
+    ports:
+      - "6380:6379"
+    deploy:
+      resources:
+        limits:
+          memory: 4G  # Redis uses memory
+        reservations:
+          memory: 2G
+  
+  kafka-broker-2:
+    image: apache/kafka:3.7.0  # Kafka 3.7+ với KRaft mode
+    hostname: redis-kafka-2
+    environment:
+      # KRaft Mode Configuration (no Zookeeper)
+      - KAFKA_NODE_ID=2
+      - KAFKA_PROCESS_ROLES=broker,controller
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@redis-kafka-1:9093,2@redis-kafka-2:9093
+      - KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://redis-kafka-2:9092
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      # Log configuration
+      - KAFKA_LOG_DIRS=/var/lib/kafka/data
+      - KAFKA_LOG_RETENTION_HOURS=168  # 7 days
+      - KAFKA_LOG_SEGMENT_BYTES=1073741824  # 1GB
+      # Metadata configuration
+      - KAFKA_METADATA_LOG_DIR=/var/lib/kafka/metadata
+      # Replication
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=2
+      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=2
+      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+      - KAFKA_DEFAULT_REPLICATION_FACTOR=2
+      - KAFKA_MIN_INSYNC_REPLICAS=1
+    volumes:
+      - kafka-2-data:/var/lib/kafka/data  # Kafka uses disk
+      - kafka-2-metadata:/var/lib/kafka/metadata  # KRaft metadata
+    ports:
+      - "9094:9092"  # Broker port
+      - "9095:9093"  # Controller port
+    deploy:
+      resources:
+        limits:
+          memory: 2G  # Kafka JVM heap
+        reservations:
+          memory: 1G
+
+volumes:
+  redis-1-data:
+  redis-2-data:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-1-metadata:
+  kafka-2-metadata:
 ```
+
+**Resource Allocation per Server (Server 5 & 6)**:
+```
+Server 5 (redis-kafka-1):
+├─ Redis Node 1: 4GB RAM (memory-based cache)
+└─ Kafka Broker 1: 2GB RAM (JVM) + Disk (event logs)
+
+Server 6 (redis-kafka-2):
+├─ Redis Node 2: 4GB RAM (memory-based cache)
+└─ Kafka Broker 2: 2GB RAM (JVM) + Disk (event logs)
+
+Total per Server:
+├─ RAM: ~6GB (4GB Redis + 2GB Kafka)
+└─ Disk: ~50GB (Kafka logs, Redis optional persistence)
+```
+
+**Perfect Resource Sharing Benefits**:
+- ✅ **No Conflict**: Redis (RAM) và Kafka (Disk) không compete resources
+- ✅ **Optimal Utilization**: Tận dụng cả memory và disk trên cùng server
+- ✅ **High Availability**: Cả Redis và Kafka đều có replication
+- ✅ **Cost Efficient**: Giảm số lượng servers cần thiết
 
 ### CI/CD Pipeline
 1. Code commit → GitHub/GitLab
