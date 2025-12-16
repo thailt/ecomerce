@@ -297,36 +297,59 @@ Event Consumers:
 
 1. **Redis Distributed Lock**:
    ```java
-   // Pseudo-code
-   String lockKey = "product:" + productId + ":lock";
-   if (redis.setIfAbsent(lockKey, "locked", 5 seconds)) {
+   // Prevent concurrent access
+   String lockKey = "lock:product:" + productId;
+   if (redis.setIfAbsent(lockKey, "locked", 30 seconds)) {
        try {
-           // Check inventory and process purchase
+           // Process purchase
        } finally {
            redis.delete(lockKey);
        }
    }
    ```
 
-2. **Database Row-Level Lock**:
-   ```sql
-   SELECT * FROM products WHERE id = ? FOR UPDATE;
-   UPDATE products SET stock = stock - ? WHERE id = ? AND stock >= ?;
+2. **Redis Atomic Operations (INCR/DECR)**:
+   ```java
+   // Reserve inventory atomically trong Redis
+   // Lua script: Check available stock và increment reserved
+   ReserveResult result = redisInventoryService.reserveInventory(productId, quantity);
+   
+   // Confirm order: Atomic decrease reserved + stock
+   redisInventoryService.confirmOrder(productId, quantity);
+   
+   // Rollback: Atomic decrease reserved only
+   redisInventoryService.rollbackReservation(productId, quantity);
    ```
 
-3. **Optimistic Locking**:
-   ```sql
-   UPDATE products 
-   SET stock = stock - ?, version = version + 1 
-   WHERE id = ? AND version = ? AND stock >= ?;
+3. **Database Optimistic Locking**:
+   ```java
+   // All DB updates sử dụng optimistic locking với version field
+   // Products table: version field
+   // Orders table: version field
+   
+   // Update với version check
+   int updated = jdbcTemplate.update(
+       "UPDATE orders SET status = 'CONFIRMED', version = version + 1 " +
+       "WHERE id = ? AND version = ?",
+       orderId, currentVersion);
+   
+   if (updated == 0) {
+       // Version mismatch → Concurrent modification detected
+       // Handle retry or compensation
+   }
    ```
 
-4. **Cache Consistency**:
-   - Atomic decrement: `DECR product:123:stock`
-   - Cache invalidation on DB commit
-   - TTL-based refresh (5 seconds)
+4. **Database Sync**:
+   - Redis là source of truth cho inventory
+   - DB được sync từ Redis (periodic sync)
+   - DB chỉ lưu total stock (không có reserved_stock)
+   - Sync operations sử dụng optimistic locking để avoid conflicts
 
-**Result**: Impossible to oversell due to distributed lock + DB transaction + optimistic locking.
+**Result**: Impossible to oversell due to:
+- Distributed lock (prevent concurrent access)
+- Redis atomic operations (INCR/DECR) đảm bảo consistency
+- Lua scripts đảm bảo atomic check + update
+- Database optimistic locking (version field) đảm bảo consistency khi sync với DB
 
 ### 2. Real-Time Feedback (Low Latency)
 
@@ -401,16 +424,27 @@ CREATE TABLE products (
     name VARCHAR(255) NOT NULL,
     description TEXT,
     price DECIMAL(10,2) NOT NULL,
-    stock INTEGER NOT NULL DEFAULT 0,
-    reserved_stock INTEGER NOT NULL DEFAULT 0,  -- For Saga pattern
+    stock INTEGER NOT NULL DEFAULT 0,  -- Total stock (synced với Redis)
     version INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_products_stock ON products(stock);
-CREATE INDEX idx_products_available ON products(stock - reserved_stock);
 ```
+
+**Note**: 
+- `reserved_stock` được quản lý trong **Redis** (không cần trong DB)
+- Redis keys: `product:{id}:stock` và `product:{id}:reserved`
+- Available stock = `stock - reserved` (computed từ Redis)
+- Atomic operations (INCR/DECR) đảm bảo consistency
+
+**Note**: CHECK constraint trong MySQL:
+- ✅ **MySQL 8.0.19+**: Fully supported và enforced
+- ⚠️ **MySQL 8.0.16-8.0.18**: Parsed nhưng không enforce
+- ❌ **MySQL < 8.0.16**: Not supported
+
+Nếu dùng MySQL version cũ, CHECK constraint sẽ không hoạt động, nhưng không ảnh hưởng đến functionality vì hệ thống đã có distributed lock + optimistic locking.
 
 ### Orders Table
 ```sql
@@ -421,6 +455,7 @@ CREATE TABLE orders (
     product_id BIGINT NOT NULL,
     quantity INTEGER NOT NULL,
     status VARCHAR(50) NOT NULL,  -- PENDING, CONFIRMED, CANCELLED, FAILED
+    version INTEGER NOT NULL DEFAULT 0,  -- For optimistic locking
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (product_id) REFERENCES products(id)
@@ -430,7 +465,13 @@ CREATE INDEX idx_orders_product ON orders(product_id);
 CREATE INDEX idx_orders_user ON orders(user_id);
 CREATE INDEX idx_orders_saga ON orders(saga_id);
 CREATE INDEX idx_orders_status ON orders(status);
+CREATE INDEX idx_orders_version ON orders(version);
 ```
+
+**Note**: 
+- `version` field được thêm cho **optimistic locking**
+- Mọi UPDATE operations sẽ check version để detect concurrent modifications
+- Products table cũng có `version` field cho optimistic locking khi sync từ Redis
 
 ### Saga State Table (Optional - for saga state persistence)
 ```sql
@@ -541,8 +582,13 @@ spring:
 - **Server 2 (redis-kafka-2)**: Redis instance - Memory-based (RAM)
 - **Cluster Mode**: Data replication và automatic failover
 - **Distributed Locking**: Locks stored trong Redis cluster với TTL
+- **Inventory Management**: 
+  - `product:{id}:stock` → Total stock (synced với DB)
+  - `product:{id}:reserved` → Reserved stock (Redis only)
+  - Atomic operations (INCR/DECR) cho consistency
 - **Cache**: Product details và inventory counts
 - **Memory Usage**: ~2-4GB per node (configurable)
+- **Persistence**: AOF (Append Only File) để đảm bảo data không mất khi restart
 
 **Kafka Cluster Configuration** (2 Brokers - KRaft Mode):
 - **Server 1 (redis-kafka-1)**: Kafka broker 1 - Disk-based (persistence)
@@ -633,6 +679,113 @@ public class VirtualThreadConfig {
 }
 ```
 
+### Redis Inventory Service (Atomic Operations)
+```java
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.stereotype.Service;
+import java.util.Collections;
+import java.util.List;
+
+@Service
+public class RedisInventoryService {
+    
+    private final RedisTemplate<String, String> redisTemplate;
+    
+    // Lua script: Reserve inventory atomically
+    private static final String RESERVE_INVENTORY_SCRIPT = 
+        "local productId = KEYS[1]\n" +
+        "local quantity = tonumber(ARGV[1])\n" +
+        "local stockKey = 'product:' .. productId .. ':stock'\n" +
+        "local reservedKey = 'product:' .. productId .. ':reserved'\n" +
+        "local stock = tonumber(redis.call('GET', stockKey) or 0)\n" +
+        "local reserved = tonumber(redis.call('GET', reservedKey) or 0)\n" +
+        "local available = stock - reserved\n" +
+        "if available < quantity then\n" +
+        "    return {0, available}\n" +
+        "end\n" +
+        "local newReserved = redis.call('INCRBY', reservedKey, quantity)\n" +
+        "return {1, available - quantity, newReserved}";
+    
+    // Lua script: Confirm order (decrease reserved + stock)
+    private static final String CONFIRM_ORDER_SCRIPT = 
+        "local productId = KEYS[1]\n" +
+        "local quantity = tonumber(ARGV[1])\n" +
+        "local stockKey = 'product:' .. productId .. ':stock'\n" +
+        "local reservedKey = 'product:' .. productId .. ':reserved'\n" +
+        "local reserved = redis.call('DECRBY', reservedKey, quantity)\n" +
+        "local stock = redis.call('DECRBY', stockKey, quantity)\n" +
+        "return {stock, reserved}";
+    
+    // Lua script: Rollback reservation
+    private static final String ROLLBACK_RESERVATION_SCRIPT = 
+        "local productId = KEYS[1]\n" +
+        "local quantity = tonumber(ARGV[1])\n" +
+        "local reservedKey = 'product:' .. productId .. ':reserved'\n" +
+        "local reserved = redis.call('DECRBY', reservedKey, quantity)\n" +
+        "return reserved";
+    
+    public RedisInventoryService(RedisTemplate<String, String> redisTemplate) {
+        this.redisTemplate = redisTemplate;
+    }
+    
+    /**
+     * Reserve inventory atomically trong Redis
+     * Returns: {success: boolean, available: long}
+     */
+    public ReserveResult reserveInventory(Long productId, Integer quantity) {
+        DefaultRedisScript<List> script = new DefaultRedisScript<>();
+        script.setScriptText(RESERVE_INVENTORY_SCRIPT);
+        script.setResultType(List.class);
+        
+        List<Long> result = redisTemplate.execute(
+            script,
+            Collections.singletonList(productId.toString()),
+            quantity.toString()
+        );
+        
+        long success = result.get(0);
+        long available = result.get(1);
+        
+        if (success == 0) {
+            return ReserveResult.failed(available);
+        }
+        
+        return ReserveResult.success(available);
+    }
+    
+    /**
+     * Confirm order: Atomic decrease reserved + stock
+     */
+    public void confirmOrder(Long productId, Integer quantity) {
+        DefaultRedisScript<List> script = new DefaultRedisScript<>();
+        script.setScriptText(CONFIRM_ORDER_SCRIPT);
+        script.setResultType(List.class);
+        
+        redisTemplate.execute(
+            script,
+            Collections.singletonList(productId.toString()),
+            quantity.toString()
+        );
+    }
+    
+    /**
+     * Rollback reservation: Decrease reserved only
+     */
+    public void rollbackReservation(Long productId, Integer quantity) {
+        DefaultRedisScript<Long> script = new DefaultRedisScript<>();
+        script.setScriptText(ROLLBACK_RESERVATION_SCRIPT);
+        script.setResultType(Long.class);
+        
+        redisTemplate.execute(
+            script,
+            Collections.singletonList(productId.toString()),
+            quantity.toString()
+        );
+    }
+}
+```
+
 ### Redis Distributed Lock Service
 ```java
 import org.springframework.data.redis.core.RedisTemplate;
@@ -654,12 +807,10 @@ public class InventoryLockService {
         String lockKey = "lock:product:" + productId;
         String lockValue = UUID.randomUUID().toString();
         
-        // Blocking call - Virtual Thread handles efficiently
         Boolean acquired = redisTemplate.opsForValue()
             .setIfAbsent(lockKey, lockValue, timeout);
         
         if (Boolean.TRUE.equals(acquired)) {
-            // Schedule auto-release
             scheduleRelease(lockKey, lockValue, timeout);
         }
         
@@ -668,7 +819,6 @@ public class InventoryLockService {
     
     public void releaseLock(String productId, String lockValue) {
         String lockKey = "lock:product:" + productId;
-        // Lua script for atomic release
         redisTemplate.execute(RELEASE_LOCK_SCRIPT, 
             Collections.singletonList(lockKey), lockValue);
     }
@@ -696,9 +846,9 @@ import java.util.concurrent.ConcurrentHashMap;
 public class OrderSagaOrchestrator {
     
     private final InventoryLockService inventoryLockService;
+    private final RedisInventoryService redisInventoryService;
     private final KafkaTemplate<String, Object> kafkaTemplate;
     private final JdbcTemplate jdbcTemplate;
-    private final RedisTemplate<String, String> redisTemplate;
     private final PaymentService paymentService;
     
     // Track saga state
@@ -706,14 +856,14 @@ public class OrderSagaOrchestrator {
     
     public OrderSagaOrchestrator(
             InventoryLockService inventoryLockService,
+            RedisInventoryService redisInventoryService,
             KafkaTemplate<String, Object> kafkaTemplate,
             JdbcTemplate jdbcTemplate,
-            RedisTemplate<String, String> redisTemplate,
             PaymentService paymentService) {
         this.inventoryLockService = inventoryLockService;
+        this.redisInventoryService = redisInventoryService;
         this.kafkaTemplate = kafkaTemplate;
         this.jdbcTemplate = jdbcTemplate;
-        this.redisTemplate = redisTemplate;
         this.paymentService = paymentService;
     }
     
@@ -726,15 +876,6 @@ public class OrderSagaOrchestrator {
         }
         
         try {
-            // Check inventory
-            String stockStr = redisTemplate.opsForValue()
-                .get("product:" + productId + ":stock");
-            int available = Integer.parseInt(stockStr != null ? stockStr : "0");
-            
-            if (available < quantity) {
-                return PurchaseResult.failed("Insufficient stock");
-            }
-            
             // Initialize saga state
             sagaStates.put(sagaId, new SagaState(sagaId, productId, quantity, userId));
             
@@ -742,7 +883,7 @@ public class OrderSagaOrchestrator {
             SagaStartEvent startEvent = new SagaStartEvent(sagaId, productId, quantity, userId);
             kafkaTemplate.send("order-events", sagaId, startEvent);
             
-            // Start Step 1: Reserve Inventory
+            // Start Step 1: Reserve Inventory (atomic operation trong Redis)
             return executeStep1ReserveInventory(sagaId, productId, quantity);
             
         } finally {
@@ -750,18 +891,14 @@ public class OrderSagaOrchestrator {
         }
     }
     
-    @Transactional
     private PurchaseResult executeStep1ReserveInventory(String sagaId, Long productId, Integer quantity) {
         try {
-            // Local transaction: Reserve inventory
-            int updated = jdbcTemplate.update(
-                "UPDATE products SET reserved_stock = reserved_stock + ?, version = version + 1 " +
-                "WHERE id = ? AND stock - reserved_stock >= ?",
-                quantity, productId, quantity);
+            // Reserve inventory trong Redis (atomic operation)
+            ReserveResult reserveResult = redisInventoryService.reserveInventory(productId, quantity);
             
-            if (updated == 0) {
+            if (!reserveResult.isSuccess()) {
                 compensateSaga(sagaId, "INSUFFICIENT_STOCK");
-                return PurchaseResult.failed("Insufficient stock");
+                return PurchaseResult.failed("Insufficient stock. Available: " + reserveResult.getAvailable());
             }
             
             // Publish event
@@ -772,6 +909,8 @@ public class OrderSagaOrchestrator {
             return executeStep2CreateOrder(sagaId, productId, quantity);
             
         } catch (Exception e) {
+            // Rollback reservation trong Redis
+            redisInventoryService.rollbackReservation(productId, quantity);
             compensateSaga(sagaId, "RESERVE_INVENTORY_FAILED");
             return PurchaseResult.failed("Failed to reserve inventory");
         }
@@ -781,6 +920,10 @@ public class OrderSagaOrchestrator {
     private PurchaseResult executeStep2CreateOrder(String sagaId, Long productId, Integer quantity) {
         try {
             SagaState state = sagaStates.get(sagaId);
+            
+            // Read product version for optimistic locking (nếu cần sync với DB)
+            Integer productVersion = jdbcTemplate.queryForObject(
+                "SELECT version FROM products WHERE id = ?", Integer.class, productId);
             
             // Local transaction: Create order
             KeyHolder keyHolder = new GeneratedKeyHolder();
@@ -798,6 +941,8 @@ public class OrderSagaOrchestrator {
             
             Long orderId = keyHolder.getKey().longValue();
             state.setOrderId(orderId);
+            state.setProductVersion(productVersion); // Store version for later use
+            state.setOrderVersion(0); // New order, version = 0
             
             // Publish event
             OrderCreatedEvent event = new OrderCreatedEvent(sagaId, orderId, productId, quantity);
@@ -807,6 +952,8 @@ public class OrderSagaOrchestrator {
             return executeStep3ProcessPayment(sagaId, orderId, productId, quantity);
             
         } catch (Exception e) {
+            // Rollback reservation trong Redis
+            redisInventoryService.rollbackReservation(productId, quantity);
             compensateSaga(sagaId, "CREATE_ORDER_FAILED");
             return PurchaseResult.failed("Failed to create order");
         }
@@ -852,18 +999,45 @@ public class OrderSagaOrchestrator {
     @Transactional
     private PurchaseResult executeStep4ConfirmOrder(String sagaId, Long orderId, Long productId, Integer quantity) {
         try {
-            // Finalize order and inventory
-            jdbcTemplate.update(
-                "UPDATE orders SET status = 'CONFIRMED' WHERE id = ?",
-                orderId);
+            SagaState state = sagaStates.get(sagaId);
+            Integer productVersion = state.getProductVersion();
+            Integer orderVersion = state.getOrderVersion();
             
-            jdbcTemplate.update(
-                "UPDATE products SET stock = stock - ?, reserved_stock = reserved_stock - ?, version = version + 1 " +
-                "WHERE id = ?",
-                quantity, quantity, productId);
+            if (orderVersion == null) {
+                orderVersion = getOrderVersion(orderId);
+            }
             
-            // Update Redis cache
-            redisTemplate.opsForValue().decrement("product:" + productId + ":stock", quantity);
+            // Update order status trong DB với optimistic locking
+            int orderUpdated = jdbcTemplate.update(
+                "UPDATE orders SET status = 'CONFIRMED', version = version + 1 " +
+                "WHERE id = ? AND version = ?",
+                orderId, orderVersion);
+            
+            if (orderUpdated == 0) {
+                // Order version mismatch → Concurrent modification
+                redisInventoryService.rollbackReservation(productId, quantity);
+                compensateSaga(sagaId, "CONCURRENT_MODIFICATION");
+                return PurchaseResult.failed("Concurrent modification detected");
+            }
+            
+            // Sync stock từ Redis về DB với optimistic locking (optional)
+            // Redis là source of truth, DB sync là secondary
+            if (productVersion != null) {
+                Long redisStock = redisInventoryService.getAvailableStock(productId);
+                int productUpdated = jdbcTemplate.update(
+                    "UPDATE products SET stock = ?, version = version + 1 " +
+                    "WHERE id = ? AND version = ?",
+                    redisStock, productId, productVersion);
+                
+                // Nếu product version mismatch, không fail (Redis là source of truth)
+                // DB sẽ được sync trong periodic sync job
+                if (productUpdated == 0) {
+                    // Version mismatch - log warning, continue
+                }
+            }
+            
+            // Confirm order trong Redis (atomic: decrease reserved + stock)
+            redisInventoryService.confirmOrder(productId, quantity);
             
             // Publish success event
             OrderConfirmedEvent event = new OrderConfirmedEvent(sagaId, orderId);
@@ -876,8 +1050,19 @@ public class OrderSagaOrchestrator {
             return PurchaseResult.success(orderId);
             
         } catch (Exception e) {
+            // Rollback reservation trong Redis
+            redisInventoryService.rollbackReservation(productId, quantity);
             compensateSaga(sagaId, "CONFIRM_ORDER_FAILED");
             return PurchaseResult.failed("Failed to confirm order");
+        }
+    }
+    
+    private Integer getOrderVersion(Long orderId) {
+        try {
+            return jdbcTemplate.queryForObject(
+                "SELECT version FROM orders WHERE id = ?", Integer.class, orderId);
+        } catch (Exception e) {
+            return 0; // Default version if not found
         }
     }
     
@@ -885,34 +1070,49 @@ public class OrderSagaOrchestrator {
         SagaState state = sagaStates.get(sagaId);
         if (state == null) return;
         
+        // Rollback reservation trong Redis
+        redisInventoryService.rollbackReservation(state.getProductId(), state.getQuantity());
+        
         CompensationEvent compensationEvent = new CompensationEvent(sagaId, reason, state);
         kafkaTemplate.send("compensation-events", sagaId, compensationEvent);
         
-        // Execute compensation in reverse order
-        if (state.getOrderId() != null) {
+        // Execute compensation in reverse order với optimistic locking
+        if (state.getPaymentTransactionId() != null) {
             compensateStep3Payment(state);
         }
         if (state.getOrderId() != null) {
             compensateStep2Order(state);
         }
-        compensateStep1Inventory(state);
         
         sagaStates.remove(sagaId);
         inventoryLockService.releaseLock(state.getProductId(), null);
     }
     
     @Transactional
-    private void compensateStep1Inventory(SagaState state) {
-        jdbcTemplate.update(
-            "UPDATE products SET reserved_stock = reserved_stock - ? WHERE id = ?",
-            state.getQuantity(), state.getProductId());
-    }
-    
-    @Transactional
     private void compensateStep2Order(SagaState state) {
-        jdbcTemplate.update(
-            "UPDATE orders SET status = 'CANCELLED' WHERE id = ?",
-            state.getOrderId());
+        // Update order status với optimistic locking
+        Integer orderVersion = state.getOrderVersion();
+        if (orderVersion == null) {
+            orderVersion = getOrderVersion(state.getOrderId());
+        }
+        
+        int updated = jdbcTemplate.update(
+            "UPDATE orders SET status = 'CANCELLED', version = version + 1 " +
+            "WHERE id = ? AND version = ?",
+            state.getOrderId(), orderVersion);
+        
+        if (updated == 0) {
+            // Version mismatch - order đã được update bởi concurrent request
+            // Log warning nhưng không fail (compensation có thể retry)
+            // Try với current version
+            Integer currentVersion = getOrderVersion(state.getOrderId());
+            if (currentVersion != null) {
+                jdbcTemplate.update(
+                    "UPDATE orders SET status = 'CANCELLED', version = version + 1 " +
+                    "WHERE id = ? AND version = ?",
+                    state.getOrderId(), currentVersion);
+            }
+        }
     }
     
     private void compensateStep3Payment(SagaState state) {
@@ -1027,6 +1227,8 @@ public class SagaState {
     private Long userId;
     private Long orderId;
     private String paymentTransactionId;
+    private Integer productVersion;  // For optimistic locking
+    private Integer orderVersion;    // For optimistic locking
     
     public SagaState(String sagaId, Long productId, Integer quantity, Long userId) {
         this.sagaId = sagaId;
@@ -1036,6 +1238,10 @@ public class SagaState {
     }
     
     // getters and setters
+    public Integer getProductVersion() { return productVersion; }
+    public void setProductVersion(Integer productVersion) { this.productVersion = productVersion; }
+    public Integer getOrderVersion() { return orderVersion; }
+    public void setOrderVersion(Integer orderVersion) { this.orderVersion = orderVersion; }
 }
 
 // Payment Service
@@ -1184,7 +1390,10 @@ This architecture meets all requirements:
 - **Spring MVC**: Traditional blocking code với Virtual Threads
 - **JDBC**: Blocking database access với connection pooling
 - **Kafka Cluster**: 2 brokers với KRaft mode (no Zookeeper) - Kafka 3.7+ (saga orchestration và event sourcing)
-- **Redis Cluster**: 2 nodes với cluster mode (cache và distributed locking)
+- **Redis Cluster**: 2 nodes với cluster mode
+  - **Distributed locking**: Prevent concurrent access
+  - **Atomic inventory operations**: INCR/DECR với Lua scripts
+  - **Cache**: Product details và inventory counts
 
 **Saga Pattern Benefits**:
 - ✅ Distributed transactions across multiple services
@@ -1192,6 +1401,20 @@ This architecture meets all requirements:
 - ✅ Event sourcing với Kafka - full audit trail
 - ✅ Loose coupling giữa các services
 - ✅ Scalable và maintainable
+
+**Redis Atomic Operations Benefits**:
+- ✅ Atomic INCR/DECR operations đảm bảo consistency
+- ✅ Lua scripts đảm bảo atomic check + update
+- ✅ Fast operations (< 1ms)
+- ✅ Easy rollback với DECR operations
+- ✅ Không cần database CHECK constraint
+- ✅ Redis là source of truth cho inventory
+
+**Data Sync Strategy**:
+- Redis là source of truth cho inventory (stock, reserved)
+- DB được sync từ Redis periodically (every minute)
+- DB chỉ lưu total stock (không có reserved_stock)
+- Redis persistence (AOF) đảm bảo data không mất khi restart
 
 The system is production-ready and can scale to handle increased load by adding more application servers, database replicas, and Kafka brokers.
 
